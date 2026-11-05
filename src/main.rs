@@ -1,6 +1,18 @@
 use eframe::egui::{
     self, Align, Color32, FontId, Frame, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
+use std::{
+    sync::mpsc::{self, Receiver, TryRecvError},
+    time::Duration,
+};
+
+mod audio;
+mod editing;
+mod playback;
+
+use audio::{AudioData, decode_audio};
+use editing::{GainEnvelope, db_to_linear};
+use playback::Playback;
 
 const BG: Color32 = Color32::from_rgb(15, 18, 24);
 const PANEL: Color32 = Color32::from_rgb(21, 25, 33);
@@ -28,13 +40,18 @@ fn main() -> eframe::Result {
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EditState {
     gain_db: f32,
     selection: [f32; 2],
+    gain_envelope: GainEnvelope,
 }
 
 struct RinaApp {
+    audio: Option<AudioData>,
+    playback: Option<Playback>,
+    import_receiver: Option<Receiver<Result<AudioData, String>>>,
+    gain_envelope: GainEnvelope,
     selection: [f32; 2],
     gain_db: f32,
     gain_dragging: bool,
@@ -51,6 +68,10 @@ struct RinaApp {
 impl Default for RinaApp {
     fn default() -> Self {
         Self {
+            audio: None,
+            playback: None,
+            import_receiver: None,
+            gain_envelope: GainEnvelope::default(),
             selection: [0.18, 0.63],
             gain_db: 0.0,
             gain_dragging: false,
@@ -70,6 +91,7 @@ impl RinaApp {
     fn save_edit(&mut self) {
         self.undo.push(EditState {
             gain_db: self.gain_db,
+            gain_envelope: self.gain_envelope.clone(),
             selection: self.selection,
         });
         self.redo.clear();
@@ -78,12 +100,17 @@ impl RinaApp {
     fn restore(&mut self, state: EditState) {
         self.gain_db = state.gain_db;
         self.selection = state.selection;
+        self.gain_envelope = state.gain_envelope;
+        if let Some(playback) = &self.playback {
+            playback.set_gain_envelope(self.gain_envelope.clone());
+        }
     }
 
     fn undo(&mut self) {
         if let Some(state) = self.undo.pop() {
             self.redo.push(EditState {
                 gain_db: self.gain_db,
+                gain_envelope: self.gain_envelope.clone(),
                 selection: self.selection,
             });
             self.restore(state);
@@ -95,6 +122,7 @@ impl RinaApp {
         if let Some(state) = self.redo.pop() {
             self.undo.push(EditState {
                 gain_db: self.gain_db,
+                gain_envelope: self.gain_envelope.clone(),
                 selection: self.selection,
             });
             self.restore(state);
@@ -102,14 +130,155 @@ impl RinaApp {
         }
     }
 
+    fn duration(&self) -> f32 {
+        self.audio.as_ref().map_or(42.0, |audio| audio.duration)
+    }
+
+    fn toggle_playback(&mut self) {
+        if self.playback.as_ref().is_some_and(Playback::is_playing) {
+            if let Some(playback) = &self.playback {
+                playback.pause();
+            }
+            self.playing = false;
+            self.notice = "Playback paused".to_owned();
+            return;
+        }
+
+        if self.playback.is_none() {
+            let Some(audio) = &self.audio else {
+                self.notice = "Import an audio file before playback".to_owned();
+                return;
+            };
+            match Playback::new(
+                audio.samples.clone(),
+                audio.sample_rate,
+                audio.channel_count(),
+                self.gain_envelope.clone(),
+            ) {
+                Ok(playback) => {
+                    playback.seek_frame(
+                        (self.playhead.clamp(0.0, 1.0) * playback.source_frames() as f32) as u64,
+                    );
+                    self.playback = Some(playback);
+                }
+                Err(error) => {
+                    self.notice = format!("Playback error: {error}");
+                    return;
+                }
+            }
+        }
+
+        if let Some(playback) = &self.playback {
+            match playback.play() {
+                Ok(()) => {
+                    self.playing = true;
+                    self.notice = format!("Playing at {} Hz", playback.output_rate());
+                }
+                Err(error) => {
+                    self.playing = false;
+                    self.notice = format!("Playback error: {error}");
+                }
+            }
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some(playback) = &self.playback {
+            playback.stop();
+        }
+        self.playing = false;
+        self.playhead = 0.0;
+        self.notice = "Playback stopped".to_owned();
+    }
+
+    fn poll_playback(&mut self) {
+        if let Some(playback) = &self.playback {
+            self.playing = playback.is_playing();
+            self.playhead =
+                playback.position_frames() as f32 / playback.source_frames().max(1) as f32;
+            if let Some(error) = playback.take_device_error() {
+                self.playing = false;
+                self.notice = error;
+            }
+        }
+    }
+
+    fn open_audio(&mut self) {
+        if self.import_receiver.is_some() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Audio files",
+                &["wav", "flac", "mp3", "ogg", "m4a", "aac", "aiff", "aif"],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+
+        self.notice = "Importing audio…".to_owned();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let (sender, receiver) = mpsc::channel();
+        self.import_receiver = Some(receiver);
+        if let Err(error) = std::thread::Builder::new()
+            .name("rina-audio-import".to_owned())
+            .spawn(move || {
+                let result = decode_audio(&path).map(|mut audio| {
+                    audio.name = name;
+                    audio
+                });
+                let _ = sender.send(result);
+            })
+        {
+            self.import_receiver = None;
+            self.notice = format!("Could not start audio import: {error}");
+        }
+    }
+
+    fn poll_import(&mut self) {
+        let result = match self.import_receiver.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => {
+                Some(Err("audio importer stopped unexpectedly".to_owned()))
+            }
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        if let Some(result) = result {
+            self.import_receiver = None;
+            match result {
+                Ok(audio) => {
+                    self.audio = Some(audio);
+                    self.playback = None;
+                    self.selection = [0.0, 1.0];
+                    self.gain_db = 0.0;
+                    self.gain_envelope = GainEnvelope::default();
+                    self.playhead = 0.0;
+                    self.zoom = 1.0;
+                    self.undo.clear();
+                    self.redo.clear();
+                    self.playing = false;
+                    self.notice = "Audio imported".to_owned();
+                }
+                Err(error) => self.notice = format!("Import failed: {error}"),
+            }
+        }
+    }
+
     fn update_shortcuts(&mut self, context: &egui::Context) {
         context.input(|input| {
-            if input.modifiers.command && input.key_pressed(egui::Key::Z) {
+            if input.modifiers.command && input.key_pressed(egui::Key::O) {
+                self.open_audio();
+            } else if input.modifiers.command && input.key_pressed(egui::Key::Z) {
                 self.undo();
             } else if input.modifiers.command && input.key_pressed(egui::Key::Y) {
                 self.redo();
             } else if input.key_pressed(egui::Key::Space) {
-                self.playing = !self.playing;
+                self.toggle_playback();
             } else if input.key_pressed(egui::Key::Plus) || input.key_pressed(egui::Key::Equals) {
                 self.zoom = (self.zoom * 1.2).min(8.0);
             } else if input.key_pressed(egui::Key::Minus) {
@@ -152,7 +321,7 @@ impl RinaApp {
                         }
                         ui.add_space(8.0);
                         if pill_button(ui, "Open audio", false).clicked() {
-                            self.notice = "File loading is not connected yet".to_owned();
+                            self.open_audio();
                         }
                         ui.add_space(12.0);
                         ui.label(RichText::new("⋯").size(22.0).color(MUTED));
@@ -259,7 +428,7 @@ impl RinaApp {
                         ui.label(
                             RichText::new(format!(
                                 "{:.2} s",
-                                (self.selection[1] - self.selection[0]) * 42.0
+                                (self.selection[1] - self.selection[0]).abs() * self.duration()
                             ))
                             .size(17.0)
                             .monospace()
@@ -290,9 +459,18 @@ impl RinaApp {
                             if !slider_response.dragged() {
                                 self.undo.push(EditState {
                                     gain_db: previous_gain,
+                                    gain_envelope: self.gain_envelope.clone(),
                                     selection: self.selection,
                                 });
                                 self.redo.clear();
+                            }
+                            self.gain_envelope.set_region(
+                                self.selection[0],
+                                self.selection[1],
+                                self.gain_db,
+                            );
+                            if let Some(playback) = &self.playback {
+                                playback.set_gain_envelope(self.gain_envelope.clone());
                             }
                             self.notice = "Region gain adjusted".to_owned();
                         }
@@ -349,8 +527,16 @@ impl RinaApp {
                 ui.add_space(18.0);
                 ui.label(RichText::new("SELECTION").size(10.0).strong().color(MUTED));
                 ui.add_space(8.0);
-                time_edit(ui, "Start", &format_time(self.selection[0] * 42.0));
-                time_edit(ui, "End", &format_time(self.selection[1] * 42.0));
+                time_edit(
+                    ui,
+                    "Start",
+                    &format_time(self.selection[0].min(self.selection[1]) * self.duration()),
+                );
+                time_edit(
+                    ui,
+                    "End",
+                    &format_time(self.selection[0].max(self.selection[1]) * self.duration()),
+                );
                 ui.add_space(8.0);
                 ui.checkbox(
                     &mut self.snap_enabled,
@@ -371,14 +557,18 @@ impl RinaApp {
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("00:12.48")
+                        RichText::new(format_time(self.playhead * self.duration()))
                             .size(13.0)
                             .monospace()
                             .strong()
                             .color(TEXT),
                     );
                     ui.add_space(10.0);
-                    transport_button(ui, "⏮");
+                    if transport_button(ui, "⏮").clicked() {
+                        if let Some(playback) = &self.playback {
+                            playback.seek_frame(0);
+                        }
+                    }
                     if ui
                         .add(
                             egui::Button::new(
@@ -392,15 +582,16 @@ impl RinaApp {
                         )
                         .clicked()
                     {
-                        self.playing = !self.playing;
-                        self.notice = if self.playing {
-                            "Playing preview".into()
-                        } else {
-                            "Playback stopped".into()
-                        };
+                        self.toggle_playback();
                     }
-                    transport_button(ui, "⏹");
-                    transport_button(ui, "⏭");
+                    if transport_button(ui, "⏹").clicked() {
+                        self.stop_playback();
+                    }
+                    if transport_button(ui, "⏭").clicked() {
+                        if let Some(playback) = &self.playback {
+                            playback.seek_frame(playback.source_frames());
+                        }
+                    }
                     ui.add_space(13.0);
                     ui.label(
                         RichText::new("●")
@@ -409,11 +600,17 @@ impl RinaApp {
                     );
                     ui.label(RichText::new("REC").size(10.0).strong().color(MUTED));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("48 kHz  ·  24-bit  ·  Stereo")
-                                .size(10.0)
-                                .color(MUTED),
+                        let audio_info = self.audio.as_ref().map_or_else(
+                            || "No audio loaded".to_owned(),
+                            |audio| {
+                                format!(
+                                    "{:.1} kHz  ·  {} ch",
+                                    audio.sample_rate as f32 / 1000.0,
+                                    audio.channel_count()
+                                )
+                            },
                         );
+                        ui.label(RichText::new(audio_info).size(10.0).color(MUTED));
                         ui.add_space(18.0);
                         ui.label(RichText::new(&self.notice).size(10.0).color(ACCENT));
                         ui.add_space(16.0);
@@ -434,13 +631,44 @@ impl RinaApp {
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("◉").size(12.0).color(ACCENT));
-                    ui.label(RichText::new("Room tone — close mic.wav").size(13.0).strong().color(TEXT));
-                    ui.label(RichText::new("STEREO").size(9.0).strong().color(MUTED));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("44.1 kHz  /  16-bit").size(10.0).color(MUTED));
-                        ui.add_space(12.0);
-                        ui.label(RichText::new("03:42").size(11.0).monospace().color(TEXT));
-                    });
+                    if let Some(audio) = &self.audio {
+                        ui.label(
+                            RichText::new(&audio.name)
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new(channel_label(audio.channel_count()))
+                                .size(9.0)
+                                .strong()
+                                .color(MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{:.1} kHz", audio.sample_rate as f32 / 1000.0))
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new(format_time(audio.duration))
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(TEXT),
+                            );
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new("Demo waveform — import audio to edit")
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new("00:42").size(11.0).monospace().color(TEXT));
+                        });
+                    }
                 });
                 ui.add_space(10.0);
                 Frame::new().fill(PANEL).stroke(Stroke::new(1.0_f32, BORDER)).corner_radius(10.0).show(ui, |ui| {
@@ -450,7 +678,7 @@ impl RinaApp {
                     let timeline_height = 35.0;
                     let waveform_height = (ui.available_height() - timeline_height - 50.0).max(260.0);
                     let (timeline_rect, _) = ui.allocate_exact_size(Vec2::new(width, timeline_height), Sense::hover());
-                    draw_timeline(ui, timeline_rect);
+                    draw_timeline(ui, timeline_rect, self.duration());
                     ui.add_space(4.0);
 
                     let (wave_rect, response) = ui.allocate_exact_size(
@@ -464,22 +692,35 @@ impl RinaApp {
                             let handle_x = wave_rect.left() + self.selection[0] * wave_rect.width()
                                 + (self.selection[1] - self.selection[0]) * wave_rect.width() * 0.5;
                             self.gain_dragging = (pos.x - handle_x).abs() < 24.0
-                                && (pos.y - wave_rect.center().y).abs() < 25.0;
+                                && (pos.y - gain_handle_y(self.gain_db, wave_rect.center().y)).abs()
+                                    < 25.0;
                             if !self.gain_dragging {
                                 let t = ((pos.x - wave_rect.left()) / wave_rect.width()).clamp(0.0, 1.0);
                                 self.selection = [t, t];
+                                self.gain_db = self.gain_envelope.gain_at(t);
                             }
                         }
                     }
                     if response.dragged() {
                         if let Some(pos) = pointer {
                             if self.gain_dragging {
-                                let delta = (wave_rect.center().y - pos.y) / 5.0;
+                                let delta = (wave_rect.center().y - pos.y) / 4.0;
                                 self.gain_db = delta.clamp(-24.0, 18.0);
+                                self.gain_envelope.set_region(
+                                    self.selection[0],
+                                    self.selection[1],
+                                    self.gain_db,
+                                );
+                                if let Some(playback) = &self.playback {
+                                    playback.set_gain_envelope(self.gain_envelope.clone());
+                                }
                                 self.notice = format!("Gain {:+.1} dB", self.gain_db);
                             } else {
                                 let t = ((pos.x - wave_rect.left()) / wave_rect.width()).clamp(0.0, 1.0);
                                 self.selection[1] = t;
+                                self.gain_db = self
+                                    .gain_envelope
+                                    .gain_at((self.selection[0] + self.selection[1]) * 0.5);
                             }
                         }
                     }
@@ -489,6 +730,11 @@ impl RinaApp {
                     if response.clicked() {
                         if let Some(pos) = pointer {
                             self.playhead = ((pos.x - wave_rect.left()) / wave_rect.width()).clamp(0.0, 1.0);
+                            if let Some(playback) = &self.playback {
+                                playback.seek_frame(
+                                    (self.playhead * playback.source_frames() as f32) as u64,
+                                );
+                            }
                         }
                     }
                     draw_waveform(
@@ -499,6 +745,8 @@ impl RinaApp {
                         self.playhead,
                         self.zoom,
                         self.playing,
+                        self.audio.as_ref(),
+                        &self.gain_envelope,
                     );
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -519,7 +767,15 @@ impl RinaApp {
                     ui.label(RichText::new("TRACKS").size(9.0).strong().color(MUTED));
                     ui.add_space(6.0);
                     ui.label(RichText::new("1").size(10.0).strong().color(ACCENT));
-                    ui.label(RichText::new("Room tone — close mic.wav").size(10.0).color(MUTED));
+                    ui.label(
+                        RichText::new(
+                            self.audio
+                                .as_ref()
+                                .map_or("Demo waveform", |audio| audio.name.as_str()),
+                        )
+                        .size(10.0)
+                        .color(MUTED),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new("＋ Add track").size(10.0).color(MUTED));
                     });
@@ -539,19 +795,23 @@ impl eframe::App for RinaApp {
             style.visuals.widgets.active.bg_fill = Color32::from_rgb(51, 65, 77);
         });
         self.update_shortcuts(context);
+        self.poll_import();
+        self.poll_playback();
         self.top_bar(context);
         self.toolbar(context);
         self.bottom_bar(context);
         self.side_panel(context);
         self.editor(context);
         if self.playing {
-            self.playhead = (self.playhead + 0.0015).fract();
             context.request_repaint();
+        }
+        if self.import_receiver.is_some() {
+            context.request_repaint_after(Duration::from_millis(100));
         }
     }
 }
 
-fn draw_timeline(ui: &egui::Ui, rect: Rect) {
+fn draw_timeline(ui: &egui::Ui, rect: Rect, duration: f32) {
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, PANEL);
     painter.line_segment(
@@ -570,7 +830,7 @@ fn draw_timeline(ui: &egui::Ui, rect: Rect) {
         painter.text(
             Pos2::new(x + 4.0, rect.top() + 8.0),
             egui::Align2::LEFT_TOP,
-            format_time(index as f32 * 5.25),
+            format_time(index as f32 * duration / 8.0),
             FontId::monospace(9.0),
             MUTED,
         );
@@ -585,6 +845,8 @@ fn draw_waveform(
     playhead: f32,
     zoom: f32,
     playing: bool,
+    audio: Option<&AudioData>,
+    gain_envelope: &GainEnvelope,
 ) {
     let painter = ui.painter();
     painter.rect_filled(rect, 5.0, Color32::from_rgb(17, 22, 29));
@@ -613,26 +875,44 @@ fn draw_waveform(
     );
     for lane in 0..2 {
         let center = rect.top() + rect.height() * (lane as f32 + 0.5) * 0.5;
-        let amplitude = rect.height() * 0.205 * (1.0 + gain_db / 30.0).clamp(0.2, 1.5);
+        let amplitude = rect.height() * 0.225;
         let step = (rect.width() / (900.0 * zoom)).max(1.1);
         let mut x = rect.left() + step * 0.5;
         while x < rect.right() {
-            let t = (x - rect.left()) / rect.width() * zoom;
-            let envelope = (0.25
-                + 0.75 * ((t * 5.2).sin().abs() * 0.65 + (t * 12.0 + 1.2).cos().abs() * 0.35))
-                * (0.72 + 0.22 * (t * 1.7).sin());
-            let detail = ((t * 123.0 + lane as f32 * 0.7).sin() * 0.55
-                + (t * 47.0 + 0.4).cos() * 0.3
-                + (t * 211.0 + lane as f32).sin() * 0.15)
-                .abs();
-            let half = amplitude * envelope * (0.35 + detail * 0.65);
+            let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let (minimum, maximum) = if let Some(audio) = audio {
+                let channel = &audio.peaks[lane.min(audio.channel_count() - 1)];
+                let first = (t * channel.len() as f32).floor() as usize;
+                let last = (((t + step / rect.width()) * channel.len() as f32).ceil() as usize)
+                    .max(first + 1)
+                    .min(channel.len());
+                channel[first.min(channel.len() - 1)..last]
+                    .iter()
+                    .fold((0.0_f32, 0.0_f32), |(min, max), sample| {
+                        (min.min(sample[0]), max.max(sample[1]))
+                    })
+            } else {
+                let envelope = (0.25
+                    + 0.75 * ((t * 5.2).sin().abs() * 0.65 + (t * 12.0 + 1.2).cos().abs() * 0.35))
+                    * (0.72 + 0.22 * (t * 1.7).sin());
+                let detail = ((t * 123.0 + lane as f32 * 0.7).sin() * 0.55
+                    + (t * 47.0 + 0.4).cos() * 0.3
+                    + (t * 211.0 + lane as f32).sin() * 0.15)
+                    .abs();
+                let half = envelope * (0.35 + detail * 0.65);
+                (-half, half)
+            };
+            let amplitude = amplitude * db_to_linear(gain_envelope.gain_at(t));
             let color = if x >= selected_rect.left() && x <= selected_rect.right() {
                 Color32::from_rgb(129, 234, 205)
             } else {
                 WAVE
             };
             painter.line_segment(
-                [Pos2::new(x, center - half), Pos2::new(x, center + half)],
+                [
+                    Pos2::new(x, center - maximum * amplitude),
+                    Pos2::new(x, center - minimum * amplitude),
+                ],
                 Stroke::new(step.min(2.0).max(1.0), color),
             );
             x += step;
@@ -640,14 +920,18 @@ fn draw_waveform(
     }
 
     let gain_handle_x = rect.left() + (start + end) * 0.5 * rect.width();
-    let gain_y = rect.center().y - (gain_db / 18.0).clamp(-1.0, 1.0) * 20.0;
-    painter.line_segment(
-        [
-            Pos2::new(selected_rect.left(), gain_y),
-            Pos2::new(selected_rect.right(), gain_y),
-        ],
-        Stroke::new(2.0_f32, ORANGE),
-    );
+    let gain_y = gain_handle_y(gain_db, rect.center().y);
+    let mut previous_point = None;
+    let mut x = selected_rect.left();
+    while x <= selected_rect.right() {
+        let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let point = Pos2::new(x, gain_handle_y(gain_envelope.gain_at(t), rect.center().y));
+        if let Some(previous) = previous_point {
+            painter.line_segment([previous, point], Stroke::new(2.0_f32, ORANGE));
+        }
+        previous_point = Some(point);
+        x += 2.0;
+    }
     painter.circle_filled(Pos2::new(gain_handle_x, gain_y), 7.0, ORANGE);
     painter.circle_stroke(
         Pos2::new(gain_handle_x, gain_y),
@@ -755,14 +1039,26 @@ fn pill_button(ui: &mut egui::Ui, label: &str, prominent: bool) -> egui::Respons
     )
 }
 
-fn transport_button(ui: &mut egui::Ui, label: &str) {
+fn transport_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(label).size(14.0).color(TEXT))
             .fill(PANEL)
             .stroke(Stroke::NONE)
             .corner_radius(6.0)
             .min_size(Vec2::new(28.0, 30.0)),
-    );
+    )
+}
+
+fn channel_label(channels: usize) -> &'static str {
+    match channels {
+        1 => "MONO",
+        2 => "STEREO",
+        _ => "MULTICHANNEL",
+    }
+}
+
+fn gain_handle_y(gain_db: f32, center_y: f32) -> f32 {
+    center_y - gain_db.clamp(-24.0, 18.0) * 4.0
 }
 
 fn format_time(seconds: f32) -> String {
