@@ -15,8 +15,8 @@ mod recording;
 
 use audio::{AudioData, decode_audio, export_wav};
 use dsp::{
-    Compressor, Equalizer, apply_compressor, apply_denoise, apply_equalizer, apply_fade_in,
-    apply_fade_out, apply_gate, apply_limiter, apply_reverb,
+    Compressor, Equalizer, ReverbParams, ReverbPreset, apply_compressor, apply_denoise,
+    apply_equalizer, apply_fade_in, apply_fade_out, apply_gate, apply_limiter, apply_reverb,
 };
 use editing::{GainEnvelope, db_to_linear, normalize_region};
 use playback::Playback;
@@ -50,8 +50,6 @@ enum Icon {
     Stop,
     Next,
     Record,
-    Action,
-    Chevron,
     Brand,
 }
 
@@ -89,6 +87,7 @@ struct EditState {
 enum EffectPanel {
     Equalizer,
     Compressor,
+    Reverb,
 }
 
 struct RinaApp {
@@ -108,6 +107,8 @@ struct RinaApp {
     effect_panel: Option<EffectPanel>,
     equalizer: Equalizer,
     compressor: Compressor,
+    reverb: ReverbParams,
+    reverb_preset: ReverbPreset,
     selection: [f32; 2],
     channel_selections: [[f32; 2]; 2],
     active_channel: usize,
@@ -148,6 +149,8 @@ impl Default for RinaApp {
             effect_panel: None,
             equalizer: Equalizer::default(),
             compressor: Compressor::default(),
+            reverb: ReverbParams::default(),
+            reverb_preset: ReverbPreset::default(),
             selection: [0.18, 0.63],
             channel_selections: [[0.18, 0.63], [0.18, 0.63]],
             active_channel: 0,
@@ -172,6 +175,13 @@ impl Default for RinaApp {
 }
 
 impl RinaApp {
+    fn invalidate_playback(&mut self) {
+        if let Some(playback) = self.playback.take() {
+            playback.pause();
+        }
+        self.playing = false;
+    }
+
     fn audio(&self) -> Option<&AudioData> {
         self.tracks.get(self.selected_track)
     }
@@ -725,10 +735,10 @@ impl RinaApp {
         &mut self,
         label: &str,
         processor: impl FnOnce(&mut [f32], u32, usize, [f32; 2]) -> Result<(), &'static str>,
-    ) {
+    ) -> bool {
         let Some(audio) = self.audio() else {
             self.notice = format!("Import an audio file before applying {label}");
-            return;
+            return false;
         };
         let sample_rate = audio.sample_rate;
         let channels = audio.channel_count();
@@ -742,7 +752,7 @@ impl RinaApp {
         let process_channels = if is_stereo { channels } else { 1 };
         if let Err(error) = processor(&mut samples, sample_rate, process_channels, self.selection) {
             self.notice = error.to_owned();
-            return;
+            return false;
         }
         self.save_edit();
         let updated_samples = if let Some(audio) = self.audio_mut() {
@@ -762,6 +772,7 @@ impl RinaApp {
             playback.set_samples(samples);
         }
         self.notice = format!("{label} applied to selected region");
+        true
     }
 
     fn apply_eq(&mut self) {
@@ -809,9 +820,75 @@ impl RinaApp {
     }
 
     fn apply_reverb(&mut self) {
-        self.process_selection("Reverb", |samples, sample_rate, channels, selection| {
-            apply_reverb(samples, sample_rate, channels, selection)
-        });
+        let params = self.reverb;
+        self.invalidate_playback();
+        if self.process_selection("Reverb", |samples, sample_rate, channels, selection| {
+            apply_reverb(samples, sample_rate, channels, selection, params)
+        }) {
+            self.effect_panel = None;
+        }
+    }
+
+    fn preview_reverb(&mut self) {
+        let Some(mut preview_track) = self.audio().cloned() else {
+            self.notice = "Import audio before previewing reverb".to_owned();
+            return;
+        };
+        let channels = preview_track.channel_count();
+        let mut samples = if self.stereo_mode {
+            preview_track.samples.to_vec()
+        } else {
+            interleave_channel(&preview_track.samples, channels, self.active_channel)
+        };
+        let process_channels = if self.stereo_mode { channels } else { 1 };
+        if let Err(error) = apply_reverb(
+            &mut samples,
+            preview_track.sample_rate,
+            process_channels,
+            self.selection,
+            self.reverb,
+        ) {
+            self.notice = error.to_owned();
+            return;
+        }
+        if self.stereo_mode {
+            preview_track.samples = samples.into();
+        } else {
+            let mut interleaved = preview_track.samples.to_vec();
+            write_channel(&mut interleaved, channels, self.active_channel, &samples);
+            preview_track.samples = interleaved.into();
+        }
+        preview_track.rebuild_peaks();
+        let samples = Arc::clone(&preview_track.samples);
+        let sample_rate = preview_track.sample_rate;
+        let channel_count = preview_track.channel_count();
+        let envelopes = self.envelopes_for_active_track();
+        self.invalidate_playback();
+        match Playback::new(samples, sample_rate, channel_count, envelopes) {
+            Ok(playback) => {
+                let mix_frames = playback.source_frames();
+                if let Some((start, end)) = selection_frame_range(self.selection, mix_frames) {
+                    playback.seek_frame(start);
+                    playback.set_playback_end_frame(end);
+                    self.playhead = start as f32 / mix_frames.max(1) as f32;
+                }
+                match playback.play() {
+                    Ok(()) => {
+                        self.playback = Some(playback);
+                        self.playing = true;
+                        self.notice = "Previewing reverb (original audio unchanged)".to_owned();
+                    }
+                    Err(error) => self.notice = format!("Reverb preview failed: {error}"),
+                }
+            }
+            Err(error) => self.notice = format!("Reverb preview failed: {error}"),
+        }
+    }
+
+    fn cancel_reverb(&mut self) {
+        self.invalidate_playback();
+        self.effect_panel = None;
+        self.notice = "Reverb cancelled; audio unchanged".to_owned();
     }
 
     fn toggle_recording(&mut self) {
@@ -1078,36 +1155,33 @@ impl RinaApp {
             return;
         }
         context.input(|input| {
-            if input.modifiers.command && input.key_pressed(egui::Key::O) {
+            let command = input.modifiers.command || input.modifiers.ctrl;
+            if command && input.key_pressed(egui::Key::N) {
+                self.normalize();
+            } else if command && input.key_pressed(egui::Key::S) {
+                self.export_audio();
+            } else if command && input.key_pressed(egui::Key::I) {
                 self.open_audio();
-            } else if input.modifiers.command && input.key_pressed(egui::Key::Z) {
+            } else if command && input.key_pressed(egui::Key::O) {
+                self.open_audio();
+            } else if command && input.key_pressed(egui::Key::Z) {
                 self.undo();
-            } else if input.modifiers.command && input.key_pressed(egui::Key::Y) {
+            } else if command && input.key_pressed(egui::Key::Y) {
                 self.redo();
-            } else if self.waveform_focused
-                && input.modifiers.command
-                && input.key_pressed(egui::Key::C)
-            {
+            } else if self.waveform_focused && command && input.key_pressed(egui::Key::C) {
                 self.copy_selection();
-            } else if self.waveform_focused
-                && input.modifiers.command
-                && input.key_pressed(egui::Key::X)
-            {
+            } else if self.waveform_focused && command && input.key_pressed(egui::Key::X) {
                 self.cut_selection();
-            } else if self.waveform_focused
-                && input.modifiers.command
-                && input.key_pressed(egui::Key::V)
-            {
+            } else if self.waveform_focused && command && input.key_pressed(egui::Key::V) {
                 self.paste_selection();
-            } else if self.waveform_focused
-                && input.modifiers.command
-                && input.key_pressed(egui::Key::A)
-            {
+            } else if self.waveform_focused && command && input.key_pressed(egui::Key::A) {
                 self.select_all();
             } else if self.waveform_focused
                 && (input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace))
             {
                 self.delete_selection();
+            } else if input.modifiers.shift && input.key_pressed(egui::Key::Space) {
+                self.toggle_recording();
             } else if self.waveform_focused && input.key_pressed(egui::Key::Space) {
                 self.toggle_playback();
             } else if self.waveform_focused && input.key_pressed(egui::Key::W) {
@@ -1213,6 +1287,16 @@ impl RinaApp {
                         self.redo();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if pill_button(ui, "Fade Out", false).clicked() {
+                            self.apply_fade_out();
+                        }
+                        if pill_button(ui, "Fade In", false).clicked() {
+                            self.apply_fade_in();
+                        }
+                        if pill_button(ui, "Normalize", false).clicked() {
+                            self.normalize();
+                        }
+                        ui.add_space(8.0);
                         if icon_button(ui, Icon::ZoomIn, 25.0, BG)
                             .on_hover_text("Zoom in")
                             .clicked()
@@ -1270,79 +1354,7 @@ impl RinaApp {
                             .monospace()
                             .color(TEXT),
                         );
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("GAIN").size(9.0).strong().color(MUTED));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!("{:+.1} dB", self.gain_db))
-                                        .size(12.0)
-                                        .monospace()
-                                        .strong()
-                                        .color(ACCENT),
-                                );
-                            });
-                        });
-                        let previous_gain = self.gain_db;
-                        let slider = egui::Slider::new(&mut self.gain_db, -24.0..=18.0)
-                            .show_value(false)
-                            .step_by(0.1);
-                        let slider_response = ui.add(slider);
-                        if slider_response.drag_started() {
-                            self.save_edit();
-                        }
-                        if slider_response.changed() {
-                            if !slider_response.dragged() {
-                                self.save_edit_with_gain(previous_gain);
-                            }
-                            self.gain_envelope.set_region(
-                                self.selection[0],
-                                self.selection[1],
-                                self.gain_db,
-                            );
-                            self.save_active_channel_state();
-                            if let Some(playback) = &self.playback {
-                                playback.set_gain_envelopes(self.envelopes_for_active_track());
-                            }
-                            self.notice = "Region gain adjusted".to_owned();
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("−24").size(9.0).color(MUTED));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new("+18 dB").size(9.0).color(MUTED));
-                            });
-                        });
                     });
-                ui.add_space(18.0);
-                ui.label(RichText::new("ONE-CLICK").size(10.0).strong().color(MUTED));
-                ui.add_space(8.0);
-                if quick_action(
-                    ui,
-                    "Normalize",
-                    "Set peak to −1 dB",
-                    "Normalize selected audio to −1 dBFS",
-                    &mut self.notice,
-                ) {
-                    self.normalize();
-                }
-                if quick_action(
-                    ui,
-                    "Fade in",
-                    "Fade selected region from silence",
-                    "Fade in applied to selected region",
-                    &mut self.notice,
-                ) {
-                    self.apply_fade_in();
-                }
-                if quick_action(
-                    ui,
-                    "Fade out",
-                    "Fade selected region to silence",
-                    "Fade out applied to selected region",
-                    &mut self.notice,
-                ) {
-                    self.apply_fade_out();
-                }
                 ui.add_space(10.0);
                 ui.label(RichText::new("PROCESS").size(10.0).strong().color(MUTED));
                 ui.add_space(8.0);
@@ -1391,7 +1403,7 @@ impl RinaApp {
                                 "Denoise" => self.apply_denoise(),
                                 "Gate" => self.apply_gate(),
                                 "Limit" => self.apply_limiter(),
-                                "Reverb" => self.apply_reverb(),
+                                "Reverb" => self.effect_panel = Some(EffectPanel::Reverb),
                                 _ => {}
                             }
                         }
@@ -1448,6 +1460,126 @@ impl RinaApp {
                                 if ui.button("Compress selection").clicked() {
                                     self.apply_compressor();
                                 }
+                            }
+                            EffectPanel::Reverb => {
+                                ui.label(RichText::new("REVERB").size(9.0).strong().color(ACCENT));
+                                let mut preset_changed = false;
+                                egui::ComboBox::from_id_salt("reverb-preset")
+                                    .selected_text(self.reverb_preset.name())
+                                    .show_ui(ui, |ui| {
+                                        for preset in ReverbPreset::ALL {
+                                            preset_changed |= ui
+                                                .selectable_value(
+                                                    &mut self.reverb_preset,
+                                                    preset,
+                                                    preset.name(),
+                                                )
+                                                .changed();
+                                        }
+                                    });
+                                if preset_changed {
+                                    self.reverb = self.reverb_preset.params();
+                                }
+                                egui::Grid::new("reverb-knobs")
+                                    .num_columns(3)
+                                    .spacing([2.0, 8.0])
+                                    .show(ui, |ui| {
+                                        rotary_knob(
+                                            ui,
+                                            "Room Size",
+                                            &mut self.reverb.room_size,
+                                            0.1,
+                                            1.0,
+                                            100.0,
+                                            "%",
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "Decay",
+                                            &mut self.reverb.decay_seconds,
+                                            0.2,
+                                            8.0,
+                                            1.0,
+                                            "s",
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "Pre-Delay",
+                                            &mut self.reverb.pre_delay_ms,
+                                            0.0,
+                                            100.0,
+                                            1.0,
+                                            "ms",
+                                        );
+                                        ui.end_row();
+                                        rotary_knob(
+                                            ui,
+                                            "Damping",
+                                            &mut self.reverb.damping,
+                                            0.0,
+                                            1.0,
+                                            100.0,
+                                            "%",
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "Diffusion",
+                                            &mut self.reverb.diffusion,
+                                            0.0,
+                                            1.0,
+                                            100.0,
+                                            "%",
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "Early Reflections",
+                                            &mut self.reverb.early_reflections,
+                                            0.0,
+                                            1.0,
+                                            100.0,
+                                            "%",
+                                        );
+                                        ui.end_row();
+                                        rotary_knob(
+                                            ui,
+                                            "Wet Level",
+                                            &mut self.reverb.wet,
+                                            0.0,
+                                            1.0,
+                                            100.0,
+                                            "%",
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "Dry Level",
+                                            &mut self.reverb.dry,
+                                            0.0,
+                                            1.0,
+                                            100.0,
+                                            "%",
+                                        );
+                                        rotary_knob(
+                                            ui,
+                                            "Stereo Width",
+                                            &mut self.reverb.stereo_width,
+                                            0.0,
+                                            1.0,
+                                            100.0,
+                                            "%",
+                                        );
+                                        ui.end_row();
+                                    });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Preview").clicked() {
+                                        self.preview_reverb();
+                                    }
+                                    if ui.button("Apply").clicked() {
+                                        self.apply_reverb();
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.cancel_reverb();
+                                    }
+                                });
                             }
                         });
                 }
@@ -2256,38 +2388,73 @@ fn draw_waveform(
     }
 }
 
-fn quick_action(
+fn rotary_knob(
     ui: &mut egui::Ui,
-    title: &str,
-    subtitle: &str,
-    message: &str,
-    notice: &mut String,
-) -> bool {
-    let response = Frame::new()
-        .fill(PANEL_ALT)
-        .stroke(Stroke::new(1.0_f32, BORDER))
-        .corner_radius(7.0)
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                icon(ui, Icon::Action, 14.0, ACCENT);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(title).size(11.0).strong().color(TEXT));
-                    ui.label(RichText::new(subtitle).size(9.0).color(MUTED));
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    icon(ui, Icon::Chevron, 16.0, MUTED);
-                });
-            });
-        });
-    let rect = response.response.rect;
-    let clicked = ui
-        .interact(rect, ui.id().with(title), Sense::click())
-        .clicked();
-    if clicked {
-        *notice = message.to_owned();
+    label: &str,
+    value: &mut f32,
+    minimum: f32,
+    maximum: f32,
+    display_scale: f32,
+    suffix: &str,
+) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(70.0, 98.0), Sense::drag());
+    if response.dragged() {
+        let delta_y = ui.input(|input| input.pointer.delta().y);
+        *value = (*value - delta_y * (maximum - minimum) / 120.0).clamp(minimum, maximum);
     }
-    clicked
+
+    let normalized = ((*value - minimum) / (maximum - minimum)).clamp(0.0, 1.0);
+    let animated = ui
+        .ctx()
+        .animate_value_with_time(response.id, normalized, 0.12)
+        .clamp(0.0, 1.0);
+    let painter = ui.painter();
+    let center = Pos2::new(rect.center().x, rect.top() + 29.0);
+    let radius = 19.0;
+    painter.circle_filled(center, radius, Color32::from_rgb(35, 41, 52));
+    painter.circle_stroke(center, radius, Stroke::new(1.0_f32, BORDER));
+
+    let start_angle = std::f32::consts::PI * 0.75;
+    let sweep = std::f32::consts::PI * 1.5;
+    let point_at = |fraction: f32| {
+        let angle = start_angle + sweep * fraction;
+        Pos2::new(
+            center.x + angle.cos() * (radius - 4.0),
+            center.y + angle.sin() * (radius - 4.0),
+        )
+    };
+    let arc_points = |fraction: f32| {
+        (0..=32)
+            .map(|step| point_at(fraction * step as f32 / 32.0))
+            .collect::<Vec<_>>()
+    };
+    painter.add(egui::Shape::line(
+        arc_points(1.0),
+        Stroke::new(2.0_f32, BORDER),
+    ));
+    painter.add(egui::Shape::line(
+        arc_points(animated),
+        Stroke::new(2.5_f32, ACCENT),
+    ));
+    let pointer = point_at(animated);
+    painter.line_segment([center, pointer], Stroke::new(2.0_f32, TEXT));
+    painter.circle_filled(pointer, 2.5, TEXT);
+    painter.text(
+        Pos2::new(rect.center().x, rect.top() + 55.0),
+        egui::Align2::CENTER_CENTER,
+        format!("{:.0} {}", *value * display_scale, suffix),
+        FontId::monospace(9.0),
+        TEXT,
+    );
+    painter.text(
+        Pos2::new(rect.center().x, rect.top() + 78.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(8.5),
+        MUTED,
+    );
+
+    response.on_hover_text("Drag vertically to adjust");
 }
 
 fn time_edit(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -2551,30 +2718,6 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, kind: Icon, color: Color32) {
         Icon::Record => {
             painter.circle_filled(center, size * 0.38, color);
         }
-        Icon::Action => {
-            line(
-                Pos2::new(rect.left() + size * 0.18, rect.bottom() - size * 0.18),
-                Pos2::new(rect.right() - size * 0.2, rect.top() + size * 0.2),
-            );
-            line(
-                Pos2::new(rect.right() - size * 0.2, rect.top() + size * 0.2),
-                Pos2::new(rect.right() - size * 0.2, rect.top() + size * 0.45),
-            );
-            line(
-                Pos2::new(rect.right() - size * 0.2, rect.top() + size * 0.2),
-                Pos2::new(rect.right() - size * 0.45, rect.top() + size * 0.2),
-            );
-        }
-        Icon::Chevron => {
-            line(
-                Pos2::new(center.x - size * 0.15, center.y - size * 0.3),
-                Pos2::new(center.x + size * 0.15, center.y),
-            );
-            line(
-                Pos2::new(center.x + size * 0.15, center.y),
-                Pos2::new(center.x - size * 0.15, center.y + size * 0.3),
-            );
-        }
         Icon::Brand => {
             painter.circle_stroke(center, size * 0.38, stroke);
             painter.circle_filled(center, size * 0.11, color);
@@ -2837,6 +2980,39 @@ mod history_tests {
     }
 
     #[test]
+    fn reverb_apply_is_undoable_and_keeps_unselected_audio_untouched() {
+        let mut samples = vec![0.0_f32; 4000];
+        samples[1000] = 0.8;
+        samples[1001] = -0.5;
+        let source: Arc<[f32]> = samples.into();
+        let mut app = stereo_app(Arc::clone(&source));
+        app.tracks[0].sample_rate = 1000;
+        app.selection = [0.25, 0.75];
+        app.reverb = ReverbParams {
+            room_size: 0.2,
+            decay_seconds: 1.5,
+            pre_delay_ms: 2.0,
+            damping: 0.3,
+            diffusion: 0.7,
+            early_reflections: 0.3,
+            wet: 0.5,
+            dry: 1.0,
+            stereo_width: 1.0,
+        };
+
+        app.apply_reverb();
+
+        assert_eq!(&app.audio().unwrap().samples[..1000], &source[..1000]);
+        assert_ne!(
+            &app.audio().unwrap().samples[1000..3000],
+            &source[1000..3000]
+        );
+        assert_eq!(&app.audio().unwrap().samples[3000..], &source[3000..]);
+        app.undo();
+        assert_eq!(app.audio().unwrap().samples.as_ref(), source.as_ref());
+    }
+
+    #[test]
     fn normalize_and_effects_only_modify_the_active_channel_and_undo_restores_it() {
         let source: Arc<[f32]> = Arc::from([0.1, 0.9, 0.2, -0.8, 0.3, 0.7, 0.4, -0.6]);
         let mut app = stereo_app(Arc::clone(&source));
@@ -2950,6 +3126,31 @@ mod history_tests {
         );
 
         assert_eq!(app.audio().unwrap().samples.as_ref(), [0.1, 0.9, 0.4, 0.6]);
+    }
+
+    #[test]
+    fn ctrl_n_normalizes_without_waveform_focus() {
+        let mut app = stereo_app(Arc::from([0.1, -0.2, 0.25, -0.4]));
+        app.selection = [0.0, 1.0];
+        let context = egui::Context::default();
+
+        let _ = context.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::N,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                modifiers: egui::Modifiers::CTRL,
+                ..Default::default()
+            },
+            |context| app.update_shortcuts(context),
+        );
+
+        assert!(app.notice.starts_with("Normalized to −1 dBFS"));
+        assert_eq!(app.undo.len(), 1);
     }
 
     #[test]

@@ -11,6 +11,115 @@ pub struct Compressor {
     pub ratio: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReverbParams {
+    pub room_size: f32,
+    pub decay_seconds: f32,
+    pub pre_delay_ms: f32,
+    pub damping: f32,
+    pub diffusion: f32,
+    pub early_reflections: f32,
+    pub wet: f32,
+    pub dry: f32,
+    pub stereo_width: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ReverbPreset {
+    #[default]
+    Room,
+    Hall,
+    Plate,
+    Cathedral,
+    Vocal,
+}
+
+impl ReverbPreset {
+    pub const ALL: [Self; 5] = [
+        Self::Room,
+        Self::Hall,
+        Self::Plate,
+        Self::Cathedral,
+        Self::Vocal,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Room => "Room",
+            Self::Hall => "Hall",
+            Self::Plate => "Plate",
+            Self::Cathedral => "Cathedral",
+            Self::Vocal => "Vocal",
+        }
+    }
+
+    pub fn params(self) -> ReverbParams {
+        match self {
+            Self::Room => ReverbParams {
+                room_size: 0.35,
+                decay_seconds: 0.75,
+                pre_delay_ms: 8.0,
+                damping: 0.55,
+                diffusion: 0.65,
+                early_reflections: 0.3,
+                wet: 0.25,
+                dry: 1.0,
+                stereo_width: 1.0,
+            },
+            Self::Hall => ReverbParams {
+                room_size: 0.72,
+                decay_seconds: 2.4,
+                pre_delay_ms: 24.0,
+                damping: 0.35,
+                diffusion: 0.75,
+                early_reflections: 0.22,
+                wet: 0.3,
+                dry: 1.0,
+                stereo_width: 1.0,
+            },
+            Self::Plate => ReverbParams {
+                room_size: 0.58,
+                decay_seconds: 1.8,
+                pre_delay_ms: 12.0,
+                damping: 0.18,
+                diffusion: 0.9,
+                early_reflections: 0.18,
+                wet: 0.32,
+                dry: 1.0,
+                stereo_width: 0.9,
+            },
+            Self::Cathedral => ReverbParams {
+                room_size: 1.0,
+                decay_seconds: 6.0,
+                pre_delay_ms: 38.0,
+                damping: 0.25,
+                diffusion: 0.8,
+                early_reflections: 0.2,
+                wet: 0.35,
+                dry: 1.0,
+                stereo_width: 1.0,
+            },
+            Self::Vocal => ReverbParams {
+                room_size: 0.42,
+                decay_seconds: 1.2,
+                pre_delay_ms: 18.0,
+                damping: 0.62,
+                diffusion: 0.55,
+                early_reflections: 0.35,
+                wet: 0.2,
+                dry: 1.0,
+                stereo_width: 0.8,
+            },
+        }
+    }
+}
+
+impl Default for ReverbParams {
+    fn default() -> Self {
+        ReverbPreset::Room.params()
+    }
+}
+
 impl Default for Compressor {
     fn default() -> Self {
         Self {
@@ -238,22 +347,158 @@ pub fn apply_reverb(
     sample_rate: u32,
     channels: usize,
     selection: [f32; 2],
+    params: ReverbParams,
 ) -> Result<(), &'static str> {
     let (start, end) = selected_frames(samples, channels, selection)?;
-    if sample_rate == 0 {
+    if sample_rate == 0 || channels == 0 {
         return Err("Audio sample rate is invalid");
     }
-    let delay_frames = ((sample_rate as usize / 5).max(1)).min(((end - start) / 4).max(1));
-    let selected = samples[start * channels..end * channels].to_vec();
-    for frame in delay_frames..end - start {
-        let output_offset = frame * channels;
-        for channel in 0..channels {
-            let delayed = samples[(start + frame - delay_frames) * channels + channel];
-            samples[(start + frame) * channels + channel] =
-                limit_sample(selected[output_offset + channel] + delayed * 0.32);
+    if !params.room_size.is_finite()
+        || !params.decay_seconds.is_finite()
+        || !params.pre_delay_ms.is_finite()
+        || !params.damping.is_finite()
+        || !params.diffusion.is_finite()
+        || !params.early_reflections.is_finite()
+        || !params.wet.is_finite()
+        || !params.dry.is_finite()
+        || !params.stereo_width.is_finite()
+    {
+        return Err("Reverb settings must be finite");
+    }
+    let room_size = params.room_size.clamp(0.1, 1.0);
+    let decay = params.decay_seconds.clamp(0.2, 8.0);
+    let pre_delay =
+        (params.pre_delay_ms.clamp(0.0, 100.0) * sample_rate as f32 / 1000.0).round() as usize;
+    let damping = params.damping.clamp(0.0, 1.0);
+    let diffusion = params.diffusion.clamp(0.0, 1.0);
+    let early_reflections = params.early_reflections.clamp(0.0, 1.0);
+    let wet = params.wet.clamp(0.0, 1.0);
+    let dry = params.dry.clamp(0.0, 1.0);
+    let stereo_width = params.stereo_width.clamp(0.0, 1.0);
+    let frame_count = end - start;
+    let mut output = vec![0.0_f32; frame_count * channels];
+    let mut wet_output = vec![0.0_f32; frame_count * channels];
+
+    for channel in 0..channels {
+        let input: Vec<f32> = (start..end)
+            .map(|frame| finite_sample(samples[frame * channels + channel]))
+            .collect();
+        let predelayed = delay_line(&input, pre_delay);
+        let mut comb_delays = [0.0_f32; 4];
+        let mut comb_lines = Vec::with_capacity(comb_delays.len());
+        let mut comb_positions = Vec::with_capacity(comb_delays.len());
+        let mut comb_filters = vec![0.0_f32; comb_delays.len()];
+        for (index, base_ms) in [29.7_f32, 37.1, 41.1, 43.7].into_iter().enumerate() {
+            let channel_spread = if channel % 2 == 0 { 1.0 } else { 1.013 };
+            let delay =
+                ((base_ms * 0.001 * sample_rate as f32 * room_size * channel_spread).round()
+                    as usize)
+                    .max(1);
+            comb_delays[index] = delay as f32 / sample_rate as f32;
+            comb_lines.push(vec![0.0_f32; delay]);
+            comb_positions.push(0_usize);
+        }
+        let feedback: Vec<_> = comb_delays
+            .iter()
+            .map(|delay_seconds| 10.0_f32.powf(-3.0 * delay_seconds / decay).clamp(0.0, 0.97))
+            .collect();
+        let mut allpass_a = Allpass::new(
+            ((5.0 * 0.001 * sample_rate as f32 * room_size).round() as usize).max(1),
+            0.1 + diffusion * 0.75,
+        );
+        let mut allpass_b = Allpass::new(
+            ((1.7 * 0.001 * sample_rate as f32 * room_size).round() as usize).max(1),
+            0.1 + diffusion * 0.75,
+        );
+        for frame in 0..frame_count {
+            let source = predelayed[frame];
+            let mut reverberated = 0.0;
+            for index in 0..comb_lines.len() {
+                let position = comb_positions[index];
+                let delayed = comb_lines[index][position];
+                comb_filters[index] += (1.0 - damping) * (delayed - comb_filters[index]);
+                comb_lines[index][position] = source + comb_filters[index] * feedback[index];
+                comb_positions[index] = (position + 1) % comb_lines[index].len();
+                reverberated += delayed;
+            }
+            reverberated *= 0.25;
+            reverberated = allpass_a.process(reverberated);
+            reverberated = allpass_b.process(reverberated);
+            let channel_spread = if channel % 2 == 0 { 1.0 } else { 1.013 };
+            let mut early = 0.0;
+            for (delay_ms, amplitude) in [
+                (5.3_f32, 0.55_f32),
+                (11.7, 0.35),
+                (19.1, 0.22),
+                (29.3, 0.12),
+            ] {
+                let delay = ((delay_ms * room_size * channel_spread * sample_rate as f32 / 1000.0)
+                    .round() as usize)
+                    .max(1);
+                if frame >= delay {
+                    early += predelayed[frame - delay] * amplitude * early_reflections;
+                }
+            }
+            wet_output[frame * channels + channel] = limit_sample(reverberated + early);
         }
     }
+    if channels >= 2 {
+        for frame in 0..frame_count {
+            let left_index = frame * channels;
+            let right_index = left_index + 1;
+            let left = wet_output[left_index];
+            let right = wet_output[right_index];
+            let mid = (left + right) * 0.5;
+            let side = (left - right) * 0.5 * stereo_width;
+            wet_output[left_index] = mid + side;
+            wet_output[right_index] = mid - side;
+        }
+    }
+    for frame in 0..frame_count {
+        for channel in 0..channels {
+            let index = frame * channels + channel;
+            output[index] = limit_sample(
+                samples[(start + frame) * channels + channel] * dry + wet_output[index] * wet,
+            );
+        }
+    }
+    samples[start * channels..end * channels].copy_from_slice(&output);
     Ok(())
+}
+
+fn delay_line(input: &[f32], delay: usize) -> Vec<f32> {
+    if delay == 0 {
+        return input.to_vec();
+    }
+    let mut output = vec![0.0; input.len()];
+    if delay < input.len() {
+        output[delay..].copy_from_slice(&input[..input.len() - delay]);
+    }
+    output
+}
+
+struct Allpass {
+    buffer: Vec<f32>,
+    position: usize,
+    feedback: f32,
+}
+
+impl Allpass {
+    fn new(delay: usize, feedback: f32) -> Self {
+        Self {
+            buffer: vec![0.0; delay],
+            position: 0,
+            feedback,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let delayed = self.buffer[self.position];
+        let output = delayed - self.feedback * input;
+        self.buffer[self.position] = input + self.feedback * output;
+        self.position = (self.position + 1) % self.buffer.len();
+        output
+    }
 }
 
 fn selected_frames(
@@ -380,8 +625,144 @@ mod tests {
         assert_eq!(limited[3], 1.0);
 
         let mut reverberated = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        apply_reverb(&mut reverberated, 10, 1, [0.0, 1.0]).unwrap();
+        apply_reverb(
+            &mut reverberated,
+            10,
+            1,
+            [0.0, 1.0],
+            ReverbPreset::Room.params(),
+        )
+        .unwrap();
         assert_eq!(reverberated[0], 1.0);
-        assert!(reverberated[2] > 0.0);
+        assert!(reverberated[1] > 0.0);
+    }
+
+    #[test]
+    fn reverb_keeps_audio_outside_selection_and_preserves_stereo_separation() {
+        let mut samples = [
+            0.25, 0.25, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.25,
+        ];
+        let original = samples;
+        let params = ReverbParams {
+            room_size: 0.1,
+            decay_seconds: 0.2,
+            pre_delay_ms: 0.0,
+            wet: 1.0,
+            dry: 0.0,
+            ..ReverbPreset::Hall.params()
+        };
+        apply_reverb(&mut samples, 100, 2, [1.0 / 6.0, 5.0 / 6.0], params).unwrap();
+
+        assert_eq!(&samples[..2], &original[..2]);
+        assert_eq!(&samples[10..], &original[10..]);
+        assert_ne!(&samples[2..10], &original[2..10]);
+        assert_ne!(samples[4], samples[5]);
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample.is_finite() && sample.abs() <= 1.0)
+        );
+    }
+
+    #[test]
+    fn reverb_dry_only_leaves_selected_samples_unchanged() {
+        let mut samples = [0.2, -0.5, 0.8, -0.1];
+        let original = samples;
+        apply_reverb(
+            &mut samples,
+            48_000,
+            2,
+            [0.0, 1.0],
+            ReverbParams {
+                wet: 0.0,
+                dry: 1.0,
+                ..ReverbPreset::Room.params()
+            },
+        )
+        .unwrap();
+        assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn reverb_presets_have_distinct_useful_settings() {
+        let presets = ReverbPreset::ALL.map(ReverbPreset::params);
+        assert!(presets.iter().all(|preset| {
+            (0.1..=1.0).contains(&preset.room_size)
+                && (0.2..=8.0).contains(&preset.decay_seconds)
+                && (0.0..=100.0).contains(&preset.pre_delay_ms)
+                && (0.0..=1.0).contains(&preset.diffusion)
+                && (0.0..=1.0).contains(&preset.early_reflections)
+                && (0.0..=1.0).contains(&preset.wet)
+                && (0.0..=1.0).contains(&preset.stereo_width)
+                && preset.dry == 1.0
+        }));
+        assert_ne!(presets[0], presets[1]);
+        assert_ne!(presets[2], presets[4]);
+    }
+
+    #[test]
+    fn reverb_diffusion_and_early_reflections_change_the_wet_signal() {
+        let render = |params: ReverbParams| {
+            let mut samples = vec![0.0_f32; 3000];
+            samples[0] = 1.0;
+            apply_reverb(&mut samples, 1000, 1, [0.0, 1.0], params).unwrap();
+            samples
+        };
+        let base = ReverbParams {
+            pre_delay_ms: 0.0,
+            early_reflections: 0.0,
+            wet: 1.0,
+            dry: 0.0,
+            ..ReverbPreset::Room.params()
+        };
+        let no_diffusion = render(ReverbParams {
+            diffusion: 0.0,
+            ..base
+        });
+        let diffuse = render(ReverbParams {
+            diffusion: 1.0,
+            ..base
+        });
+        let no_early = render(base);
+        let with_early = render(ReverbParams {
+            early_reflections: 1.0,
+            ..base
+        });
+
+        assert_ne!(no_diffusion, diffuse);
+        assert_ne!(no_early, with_early);
+    }
+
+    #[test]
+    fn reverb_stereo_width_controls_wet_channel_spread() {
+        let render = |stereo_width| {
+            let mut samples = vec![0.0_f32; 4000];
+            samples[0] = 1.0;
+            apply_reverb(
+                &mut samples,
+                1000,
+                2,
+                [0.0, 1.0],
+                ReverbParams {
+                    pre_delay_ms: 0.0,
+                    early_reflections: 0.0,
+                    wet: 1.0,
+                    dry: 0.0,
+                    stereo_width,
+                    ..ReverbPreset::Room.params()
+                },
+            )
+            .unwrap();
+            samples
+        };
+        let mono_width = render(0.0);
+        let full_width = render(1.0);
+
+        assert_ne!(mono_width, full_width);
+        assert!(
+            mono_width
+                .chunks_exact(2)
+                .all(|frame| (frame[0] - frame[1]).abs() < 1e-6)
+        );
     }
 }

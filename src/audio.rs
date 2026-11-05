@@ -12,6 +12,7 @@ use symphonia::core::{
 
 use crate::editing::{GainEnvelope, db_to_linear};
 
+#[derive(Clone)]
 pub struct AudioData {
     pub name: String,
     pub sample_rate: u32,
