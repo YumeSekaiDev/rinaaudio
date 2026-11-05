@@ -18,9 +18,10 @@ struct SharedPlayback {
     source_rate: u32,
     source_channels: usize,
     source_frames: u64,
+    playback_end_frame: AtomicU64,
     position: AtomicU64,
     playing: AtomicBool,
-    gain: RwLock<GainEnvelope>,
+    gain: RwLock<Vec<GainEnvelope>>,
     device_error: Mutex<Option<String>>,
 }
 
@@ -35,7 +36,7 @@ impl Playback {
         samples: Arc<[f32]>,
         source_rate: u32,
         source_channels: usize,
-        gain: GainEnvelope,
+        gain: Vec<GainEnvelope>,
     ) -> Result<Self, String> {
         if source_rate == 0 || source_channels == 0 || samples.is_empty() {
             return Err("audio track has no playable samples".to_owned());
@@ -59,6 +60,7 @@ impl Playback {
         let config: StreamConfig = supported_config.clone().into();
         let shared = Arc::new(SharedPlayback {
             source_frames: (samples.len() / source_channels) as u64,
+            playback_end_frame: AtomicU64::new((samples.len() / source_channels) as u64),
             samples: RwLock::new(samples),
             source_rate,
             source_channels,
@@ -139,6 +141,12 @@ impl Playback {
             .store(frame.saturating_mul(POSITION_ONE), Ordering::Release);
     }
 
+    pub fn set_playback_end_frame(&self, frame: u64) {
+        self.shared
+            .playback_end_frame
+            .store(frame.min(self.shared.source_frames), Ordering::Release);
+    }
+
     pub fn position_frames(&self) -> u64 {
         self.shared.position.load(Ordering::Acquire) >> POSITION_FRACTION_BITS
     }
@@ -151,7 +159,7 @@ impl Playback {
         self.shared.playing.load(Ordering::Acquire)
     }
 
-    pub fn set_gain_envelope(&self, gain: GainEnvelope) {
+    pub fn set_gain_envelopes(&self, gain: Vec<GainEnvelope>) {
         if let Ok(mut current) = self.shared.gain.write() {
             *current = gain;
         }
@@ -215,9 +223,13 @@ where
 
         let position = shared.position.load(Ordering::Relaxed);
         let source_frame = position >> POSITION_FRACTION_BITS;
-        if source_frame >= shared.source_frames || samples.is_none() {
+        let playback_end_frame = shared
+            .playback_end_frame
+            .load(Ordering::Acquire)
+            .min(shared.source_frames);
+        if source_frame >= playback_end_frame || samples.is_none() {
             shared.position.store(
-                shared.source_frames.saturating_mul(POSITION_ONE),
+                playback_end_frame.saturating_mul(POSITION_ONE),
                 Ordering::Release,
             );
             shared.playing.store(false, Ordering::Release);
@@ -226,15 +238,17 @@ where
         }
 
         let fraction = (position & (POSITION_ONE - 1)) as f32 / POSITION_ONE as f32;
-        let next_frame = (source_frame + 1).min(shared.source_frames - 1);
-        let gain_db = gain.as_ref().map_or(0.0, |envelope| {
-            envelope.gain_at(source_frame as f32 / shared.source_frames as f32)
-        });
-        let amplitude = db_to_linear(gain_db);
+        let next_frame = (source_frame + 1).min(playback_end_frame - 1);
         for (output_channel, sample) in output_frame.iter_mut().enumerate() {
             let value = if output_channels == 1 && shared.source_channels > 1 {
                 let mut sum = 0.0;
                 for source_channel in 0..shared.source_channels {
+                    let gain_db = gain
+                        .as_ref()
+                        .and_then(|envelopes| envelopes.get(source_channel))
+                        .map_or(0.0, |envelope| {
+                            envelope.gain_at(source_frame as f32 / shared.source_frames as f32)
+                        });
                     sum += interpolated_sample(
                         shared,
                         samples.as_ref().unwrap(),
@@ -242,7 +256,7 @@ where
                         next_frame,
                         fraction,
                         source_channel,
-                    );
+                    ) * db_to_linear(gain_db);
                 }
                 sum / shared.source_channels as f32
             } else {
@@ -251,6 +265,12 @@ where
                 } else {
                     output_channel.min(shared.source_channels - 1)
                 };
+                let gain_db = gain
+                    .as_ref()
+                    .and_then(|envelopes| envelopes.get(source_channel))
+                    .map_or(0.0, |envelope| {
+                        envelope.gain_at(source_frame as f32 / shared.source_frames as f32)
+                    });
                 interpolated_sample(
                     shared,
                     samples.as_ref().unwrap(),
@@ -258,9 +278,9 @@ where
                     next_frame,
                     fraction,
                     source_channel,
-                )
+                ) * db_to_linear(gain_db)
             };
-            *sample = T::from_sample((value * amplitude).clamp(-1.0, 1.0));
+            *sample = T::from_sample(value.clamp(-1.0, 1.0));
         }
         shared
             .position
@@ -291,9 +311,10 @@ mod tests {
             source_rate: 48_000,
             source_channels: channels,
             source_frames: (samples.len() / channels) as u64,
+            playback_end_frame: AtomicU64::new((samples.len() / channels) as u64),
             position: AtomicU64::new(0),
             playing: AtomicBool::new(true),
-            gain: RwLock::new(gain),
+            gain: RwLock::new(vec![gain.clone(), gain]),
             device_error: Mutex::new(None),
         }
     }
@@ -328,5 +349,45 @@ mod tests {
         assert_eq!(output, [0.25, -0.5, 0.0, 0.0]);
         assert!(!shared.playing.load(Ordering::Acquire));
         assert_eq!(shared.position.load(Ordering::Acquire), 2 * POSITION_ONE);
+    }
+
+    #[test]
+    fn playback_stops_at_selected_end_without_rendering_beyond_it() {
+        let shared = shared(&[0.1, 0.2, 0.3, 0.4], 1, GainEnvelope::default());
+        shared.playback_end_frame.store(2, Ordering::Release);
+        shared.position.store(POSITION_ONE, Ordering::Release);
+        let mut output = [0.0_f32; 3];
+
+        render(&mut output, 1, POSITION_ONE, &shared);
+
+        assert_eq!(output, [0.2, 0.0, 0.0]);
+        assert!(!shared.playing.load(Ordering::Acquire));
+        assert_eq!(shared.position.load(Ordering::Acquire), 2 * POSITION_ONE);
+    }
+
+    #[test]
+    fn paused_playback_outputs_silence_without_moving_the_cursor() {
+        let shared = shared(&[0.1, 0.2], 1, GainEnvelope::default());
+        shared.playing.store(false, Ordering::Release);
+        let mut output = [1.0_f32; 2];
+
+        render(&mut output, 1, POSITION_ONE, &shared);
+
+        assert_eq!(output, [0.0, 0.0]);
+        assert_eq!(shared.position.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn playback_applies_left_and_right_gain_envelopes_independently() {
+        let mut left = GainEnvelope::default();
+        left.set_region(0.0, 1.0, 6.0206);
+        let shared = shared(&[0.25, 0.25], 2, GainEnvelope::default());
+        *shared.gain.write().unwrap() = vec![left, GainEnvelope::default()];
+        let mut output = [0.0_f32; 2];
+
+        render(&mut output, 2, POSITION_ONE, &shared);
+
+        assert!((output[0] - 0.5).abs() < 0.001);
+        assert!((output[1] - 0.25).abs() < 0.001);
     }
 }

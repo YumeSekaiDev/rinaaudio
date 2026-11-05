@@ -95,6 +95,167 @@ pub fn apply_compressor(
     Ok(())
 }
 
+pub fn apply_fade_in(
+    samples: &mut [f32],
+    channels: usize,
+    selection: [f32; 2],
+) -> Result<(), &'static str> {
+    let (start, end) = selected_frames(samples, channels, selection)?;
+    let frames = end - start;
+    for (offset, frame) in samples[start * channels..end * channels]
+        .chunks_exact_mut(channels)
+        .enumerate()
+    {
+        let gain = if frames == 1 {
+            0.0
+        } else {
+            offset as f32 / (frames - 1) as f32
+        };
+        for sample in frame {
+            *sample = limit_sample(finite_sample(*sample) * gain);
+        }
+    }
+    Ok(())
+}
+
+pub fn apply_fade_out(
+    samples: &mut [f32],
+    channels: usize,
+    selection: [f32; 2],
+) -> Result<(), &'static str> {
+    let (start, end) = selected_frames(samples, channels, selection)?;
+    let frames = end - start;
+    for (offset, frame) in samples[start * channels..end * channels]
+        .chunks_exact_mut(channels)
+        .enumerate()
+    {
+        let gain = if frames == 1 {
+            0.0
+        } else {
+            (frames - offset - 1) as f32 / (frames - 1) as f32
+        };
+        for sample in frame {
+            *sample = limit_sample(finite_sample(*sample) * gain);
+        }
+    }
+    Ok(())
+}
+
+pub fn apply_denoise(
+    samples: &mut [f32],
+    channels: usize,
+    selection: [f32; 2],
+    threshold_db: f32,
+    reduction_db: f32,
+) -> Result<(), &'static str> {
+    let (start, end) = selected_frames(samples, channels, selection)?;
+    if !threshold_db.is_finite() || !reduction_db.is_finite() {
+        return Err("Denoise settings must be finite");
+    }
+    let threshold = db_to_linear(threshold_db.clamp(-90.0, -6.0));
+    let floor = threshold * 0.5;
+    let reduction = db_to_linear(-reduction_db.clamp(0.0, 60.0));
+    for frame in samples[start * channels..end * channels].chunks_exact_mut(channels) {
+        let peak = frame
+            .iter()
+            .map(|&sample| finite_sample(sample).abs())
+            .fold(0.0_f32, f32::max);
+        let gain = if peak <= floor {
+            reduction
+        } else if peak < threshold {
+            let blend = (peak - floor) / (threshold - floor);
+            reduction + (1.0 - reduction) * blend
+        } else {
+            1.0
+        };
+        for sample in frame {
+            *sample = limit_sample(finite_sample(*sample) * gain);
+        }
+    }
+    Ok(())
+}
+
+pub fn apply_gate(
+    samples: &mut [f32],
+    channels: usize,
+    selection: [f32; 2],
+    threshold_db: f32,
+) -> Result<(), &'static str> {
+    let (start, end) = selected_frames(samples, channels, selection)?;
+    if !threshold_db.is_finite() {
+        return Err("Gate threshold must be finite");
+    }
+    let threshold = db_to_linear(threshold_db.clamp(-90.0, -6.0));
+    let mut envelope = 0.0_f32;
+    for frame in samples[start * channels..end * channels].chunks_exact_mut(channels) {
+        let peak = frame
+            .iter()
+            .map(|&sample| finite_sample(sample).abs())
+            .fold(0.0_f32, f32::max);
+        let coefficient = if peak > envelope { 0.35 } else { 0.04 };
+        envelope += coefficient * (peak - envelope);
+        let gain = if envelope >= threshold { 1.0 } else { 0.0 };
+        for sample in frame {
+            *sample = finite_sample(*sample) * gain;
+        }
+    }
+    Ok(())
+}
+
+pub fn apply_limiter(
+    samples: &mut [f32],
+    channels: usize,
+    selection: [f32; 2],
+    ceiling_db: f32,
+) -> Result<(), &'static str> {
+    let (start, end) = selected_frames(samples, channels, selection)?;
+    if !ceiling_db.is_finite() {
+        return Err("Limiter ceiling must be finite");
+    }
+    let ceiling = db_to_linear(ceiling_db.clamp(-24.0, 0.0));
+    let mut envelope = 0.0_f32;
+    for frame in samples[start * channels..end * channels].chunks_exact_mut(channels) {
+        let peak = frame
+            .iter()
+            .map(|&sample| finite_sample(sample).abs())
+            .fold(0.0_f32, f32::max);
+        let coefficient = if peak > envelope { 0.8 } else { 0.02 };
+        envelope += coefficient * (peak - envelope);
+        let gain = if envelope > ceiling {
+            ceiling / envelope
+        } else {
+            1.0
+        };
+        for sample in frame {
+            *sample = (finite_sample(*sample) * gain).clamp(-ceiling, ceiling);
+        }
+    }
+    Ok(())
+}
+
+pub fn apply_reverb(
+    samples: &mut [f32],
+    sample_rate: u32,
+    channels: usize,
+    selection: [f32; 2],
+) -> Result<(), &'static str> {
+    let (start, end) = selected_frames(samples, channels, selection)?;
+    if sample_rate == 0 {
+        return Err("Audio sample rate is invalid");
+    }
+    let delay_frames = ((sample_rate as usize / 5).max(1)).min(((end - start) / 4).max(1));
+    let selected = samples[start * channels..end * channels].to_vec();
+    for frame in delay_frames..end - start {
+        let output_offset = frame * channels;
+        for channel in 0..channels {
+            let delayed = samples[(start + frame - delay_frames) * channels + channel];
+            samples[(start + frame) * channels + channel] =
+                limit_sample(selected[output_offset + channel] + delayed * 0.32);
+        }
+    }
+    Ok(())
+}
+
 fn selected_frames(
     samples: &[f32],
     channels: usize,
@@ -181,5 +342,46 @@ mod tests {
         assert_eq!(&samples[6..], &original[6..]);
         assert!(samples[2].abs() < original[2].abs());
         assert!((samples[2] + samples[3]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fades_change_only_the_selected_range() {
+        let mut fade_in = [0.8, 0.8, 0.8, 0.8, 0.8];
+        apply_fade_in(&mut fade_in, 1, [0.2, 0.8]).unwrap();
+        assert_eq!(fade_in[0], 0.8);
+        assert_eq!(&fade_in[1..4], &[0.0, 0.4, 0.8]);
+        assert_eq!(fade_in[4], 0.8);
+
+        let mut fade_out = [0.8, 0.8, 0.8, 0.8, 0.8];
+        apply_fade_out(&mut fade_out, 1, [0.2, 0.8]).unwrap();
+        assert_eq!(&fade_out[1..4], &[0.8, 0.4, 0.0]);
+        assert_eq!(fade_out[0], 0.8);
+        assert_eq!(fade_out[4], 0.8);
+    }
+
+    #[test]
+    fn denoise_gate_limiter_and_reverb_process_only_the_selection() {
+        let mut denoised = [0.5, 0.002, 0.002, 0.5];
+        apply_denoise(&mut denoised, 1, [0.25, 0.75], -40.0, 20.0).unwrap();
+        assert_eq!(denoised[0], 0.5);
+        assert!(denoised[1] < 0.002);
+        assert_eq!(denoised[3], 0.5);
+
+        let mut gated = [0.5, 0.001, 0.001, 0.5];
+        apply_gate(&mut gated, 1, [0.25, 0.75], -30.0).unwrap();
+        assert_eq!(gated[0], 0.5);
+        assert_eq!(&gated[1..3], &[0.0, 0.0]);
+        assert_eq!(gated[3], 0.5);
+
+        let mut limited = [1.0, 1.0, 1.0, 1.0];
+        apply_limiter(&mut limited, 1, [0.25, 0.75], -6.0).unwrap();
+        assert_eq!(limited[0], 1.0);
+        assert!(limited[1..3].iter().all(|sample| sample.abs() <= 0.502));
+        assert_eq!(limited[3], 1.0);
+
+        let mut reverberated = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        apply_reverb(&mut reverberated, 10, 1, [0.0, 1.0]).unwrap();
+        assert_eq!(reverberated[0], 1.0);
+        assert!(reverberated[2] > 0.0);
     }
 }

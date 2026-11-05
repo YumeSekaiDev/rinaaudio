@@ -28,7 +28,11 @@ impl AudioData {
     pub fn rebuild_peaks(&mut self) {
         const BUCKET_FRAMES: usize = 512;
         let channels = self.channel_count();
-        if channels == 0 || self.samples.is_empty() || self.samples.len() % channels != 0 {
+        if channels == 0 || self.samples.len() % channels != 0 {
+            return;
+        }
+        if self.samples.is_empty() {
+            self.peaks.iter_mut().for_each(Vec::clear);
             return;
         }
         let mut peaks = vec![Vec::new(); channels];
@@ -61,6 +65,37 @@ impl AudioData {
             }
         }
         self.peaks = peaks;
+    }
+
+    pub fn append_peak_samples(&mut self, samples: &[f32], frames_in_bucket: &mut usize) {
+        const BUCKET_FRAMES: usize = 512;
+        let channels = self.channel_count();
+        if channels == 0 || samples.len() % channels != 0 {
+            return;
+        }
+        for frame in samples.chunks_exact(channels) {
+            if *frames_in_bucket == 0 {
+                for channel_peaks in &mut self.peaks {
+                    channel_peaks.push([f32::INFINITY, f32::NEG_INFINITY]);
+                }
+            }
+            for (channel, &sample) in frame.iter().enumerate() {
+                let sample = if sample.is_finite() {
+                    sample.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let peak = self.peaks[channel]
+                    .last_mut()
+                    .expect("a peak bucket is created for each frame");
+                peak[0] = peak[0].min(sample);
+                peak[1] = peak[1].max(sample);
+            }
+            *frames_in_bucket += 1;
+            if *frames_in_bucket == BUCKET_FRAMES {
+                *frames_in_bucket = 0;
+            }
+        }
     }
 }
 
@@ -183,7 +218,7 @@ pub fn export_wav(
     samples: &[f32],
     sample_rate: u32,
     channels: usize,
-    envelope: &GainEnvelope,
+    envelopes: &[GainEnvelope],
 ) -> Result<(), String> {
     if sample_rate == 0 || channels == 0 || samples.is_empty() || samples.len() % channels != 0 {
         return Err("Audio has no valid samples to export".to_owned());
@@ -222,8 +257,10 @@ pub fn export_wav(
 
     let frame_count = samples.len() / channels;
     for (frame_index, frame) in samples.chunks_exact(channels).enumerate() {
-        let gain = db_to_linear(envelope.gain_at(frame_index as f32 / frame_count as f32));
-        for &sample in frame {
+        for (channel, &sample) in frame.iter().enumerate() {
+            let gain = envelopes.get(channel).map_or(1.0, |envelope| {
+                db_to_linear(envelope.gain_at(frame_index as f32 / frame_count as f32))
+            });
             let sample = if sample.is_finite() {
                 (sample * gain).clamp(-1.0, 1.0)
             } else {
@@ -288,6 +325,25 @@ mod tests {
     }
 
     #[test]
+    fn live_peak_updates_keep_partial_stereo_buckets_current() {
+        let mut audio = AudioData {
+            name: "Recording".to_owned(),
+            sample_rate: 48_000,
+            peaks: vec![Vec::new(), Vec::new()],
+            samples: Arc::from([]),
+            duration: 0.0,
+        };
+        let mut frames_in_bucket = 0;
+
+        audio.append_peak_samples(&[0.4, -0.2], &mut frames_in_bucket);
+        audio.append_peak_samples(&[-0.7, 0.8], &mut frames_in_bucket);
+
+        assert_eq!(frames_in_bucket, 2);
+        assert_eq!(audio.peaks[0], [[-0.7, 0.4]]);
+        assert_eq!(audio.peaks[1], [[-0.2, 0.8]]);
+    }
+
+    #[test]
     fn wav_export_applies_region_envelope_to_samples() {
         let path =
             std::env::temp_dir().join(format!("rina-audio-export-{}.wav", std::process::id()));
@@ -295,11 +351,29 @@ mod tests {
         let mut envelope = GainEnvelope::default();
         envelope.set_region(0.5, 1.0, -6.0206);
 
-        export_wav(&path, &samples, 8000, 1, &envelope).unwrap();
+        export_wav(&path, &samples, 8000, 1, &[envelope]).unwrap();
         let exported = decode_audio(&path).unwrap();
         fs::remove_file(path).unwrap();
 
         assert!((exported.samples[0] - 0.25).abs() < 0.001);
         assert!((exported.samples[2] - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn wav_export_applies_independent_channel_envelopes() {
+        let path = std::env::temp_dir().join(format!(
+            "rina-audio-stereo-export-{}.wav",
+            std::process::id()
+        ));
+        let samples = [0.5, 0.5, 0.5, 0.5];
+        let mut right = GainEnvelope::default();
+        right.set_region(0.0, 1.0, -6.0206);
+
+        export_wav(&path, &samples, 8000, 2, &[GainEnvelope::default(), right]).unwrap();
+        let exported = decode_audio(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!((exported.samples[0] - 0.5).abs() < 0.001);
+        assert!((exported.samples[1] - 0.25).abs() < 0.001);
     }
 }
