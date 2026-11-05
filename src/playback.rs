@@ -14,7 +14,7 @@ const POSITION_FRACTION_BITS: u32 = 32;
 const POSITION_ONE: u64 = 1 << POSITION_FRACTION_BITS;
 
 struct SharedPlayback {
-    samples: Arc<[f32]>,
+    samples: RwLock<Arc<[f32]>>,
     source_rate: u32,
     source_channels: usize,
     source_frames: u64,
@@ -59,7 +59,7 @@ impl Playback {
         let config: StreamConfig = supported_config.clone().into();
         let shared = Arc::new(SharedPlayback {
             source_frames: (samples.len() / source_channels) as u64,
-            samples,
+            samples: RwLock::new(samples),
             source_rate,
             source_channels,
             position: AtomicU64::new(0),
@@ -157,6 +157,14 @@ impl Playback {
         }
     }
 
+    pub fn set_samples(&self, samples: Arc<[f32]>) {
+        if samples.len() == self.shared.source_frames as usize * self.shared.source_channels
+            && let Ok(mut current) = self.shared.samples.write()
+        {
+            *current = samples;
+        }
+    }
+
     pub fn take_device_error(&self) -> Option<String> {
         self.shared
             .device_error
@@ -198,6 +206,7 @@ where
 {
     let silence = T::from_sample(0.0);
     let gain = shared.gain.read().ok();
+    let samples = shared.samples.read().ok();
     for output_frame in output.chunks_mut(output_channels.max(1)) {
         if !shared.playing.load(Ordering::Acquire) {
             output_frame.fill(silence);
@@ -206,7 +215,7 @@ where
 
         let position = shared.position.load(Ordering::Relaxed);
         let source_frame = position >> POSITION_FRACTION_BITS;
-        if source_frame >= shared.source_frames {
+        if source_frame >= shared.source_frames || samples.is_none() {
             shared.position.store(
                 shared.source_frames.saturating_mul(POSITION_ONE),
                 Ordering::Release,
@@ -228,6 +237,7 @@ where
                 for source_channel in 0..shared.source_channels {
                     sum += interpolated_sample(
                         shared,
+                        samples.as_ref().unwrap(),
                         source_frame,
                         next_frame,
                         fraction,
@@ -241,7 +251,14 @@ where
                 } else {
                     output_channel.min(shared.source_channels - 1)
                 };
-                interpolated_sample(shared, source_frame, next_frame, fraction, source_channel)
+                interpolated_sample(
+                    shared,
+                    samples.as_ref().unwrap(),
+                    source_frame,
+                    next_frame,
+                    fraction,
+                    source_channel,
+                )
             };
             *sample = T::from_sample((value * amplitude).clamp(-1.0, 1.0));
         }
@@ -253,13 +270,14 @@ where
 
 fn interpolated_sample(
     shared: &SharedPlayback,
+    samples: &[f32],
     frame: u64,
     next_frame: u64,
     fraction: f32,
     channel: usize,
 ) -> f32 {
-    let first = shared.samples[frame as usize * shared.source_channels + channel];
-    let next = shared.samples[next_frame as usize * shared.source_channels + channel];
+    let first = samples[frame as usize * shared.source_channels + channel];
+    let next = samples[next_frame as usize * shared.source_channels + channel];
     first + (next - first) * fraction
 }
 
@@ -269,7 +287,7 @@ mod tests {
 
     fn shared(samples: &[f32], channels: usize, gain: GainEnvelope) -> SharedPlayback {
         SharedPlayback {
-            samples: Arc::from(samples),
+            samples: RwLock::new(Arc::from(samples)),
             source_rate: 48_000,
             source_channels: channels,
             source_frames: (samples.len() / channels) as u64,

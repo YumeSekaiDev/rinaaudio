@@ -1,9 +1,16 @@
-use std::{fs::File, io::ErrorKind, path::Path, sync::Arc};
+use std::{
+    fs::File,
+    io::{BufWriter, ErrorKind, Write},
+    path::Path,
+    sync::Arc,
+};
 
 use symphonia::core::{
     codecs::DecoderOptions, errors::Error as SymphoniaError, formats::FormatOptions,
     io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
 };
+
+use crate::editing::{GainEnvelope, db_to_linear};
 
 pub struct AudioData {
     pub name: String,
@@ -16,6 +23,44 @@ pub struct AudioData {
 impl AudioData {
     pub fn channel_count(&self) -> usize {
         self.peaks.len()
+    }
+
+    pub fn rebuild_peaks(&mut self) {
+        const BUCKET_FRAMES: usize = 512;
+        let channels = self.channel_count();
+        if channels == 0 || self.samples.is_empty() || self.samples.len() % channels != 0 {
+            return;
+        }
+        let mut peaks = vec![Vec::new(); channels];
+        for bucket in self.samples.chunks_exact(channels * BUCKET_FRAMES) {
+            let mut channel_peaks = vec![[f32::INFINITY, f32::NEG_INFINITY]; channels];
+            for frame in bucket.chunks_exact(channels) {
+                for (channel, &sample) in frame.iter().enumerate() {
+                    let sample = if sample.is_finite() { sample } else { 0.0 };
+                    channel_peaks[channel][0] = channel_peaks[channel][0].min(sample);
+                    channel_peaks[channel][1] = channel_peaks[channel][1].max(sample);
+                }
+            }
+            for (channel, peak) in peaks.iter_mut().zip(channel_peaks) {
+                channel.push(peak);
+            }
+        }
+        let consumed_frames = peaks.first().map_or(0, Vec::len) * BUCKET_FRAMES;
+        let remaining_samples = &self.samples[consumed_frames * channels..];
+        if !remaining_samples.is_empty() {
+            let mut channel_peaks = vec![[f32::INFINITY, f32::NEG_INFINITY]; channels];
+            for frame in remaining_samples.chunks_exact(channels) {
+                for (channel, &sample) in frame.iter().enumerate() {
+                    let sample = if sample.is_finite() { sample } else { 0.0 };
+                    channel_peaks[channel][0] = channel_peaks[channel][0].min(sample);
+                    channel_peaks[channel][1] = channel_peaks[channel][1].max(sample);
+                }
+            }
+            for (channel, peak) in peaks.iter_mut().zip(channel_peaks) {
+                channel.push(peak);
+            }
+        }
+        self.peaks = peaks;
     }
 }
 
@@ -133,6 +178,72 @@ pub fn decode_audio(path: &Path) -> Result<AudioData, String> {
     })
 }
 
+pub fn export_wav(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: usize,
+    envelope: &GainEnvelope,
+) -> Result<(), String> {
+    if sample_rate == 0 || channels == 0 || samples.is_empty() || samples.len() % channels != 0 {
+        return Err("Audio has no valid samples to export".to_owned());
+    }
+
+    let data_bytes = samples
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .filter(|bytes| *bytes <= u32::MAX - 36)
+        .ok_or_else(|| "Audio is too large for a standard WAV file".to_owned())?;
+    let block_align = channels
+        .checked_mul(2)
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or_else(|| "Too many audio channels for PCM WAV export".to_owned())?;
+    let byte_rate = sample_rate
+        .checked_mul(block_align as u32)
+        .ok_or_else(|| "Audio sample rate is too large for WAV export".to_owned())?;
+    let output =
+        File::create(path).map_err(|error| format!("could not create WAV file: {error}"))?;
+    let mut writer = BufWriter::new(output);
+    writer
+        .write_all(b"RIFF")
+        .and_then(|_| writer.write_all(&(36_u32 + data_bytes).to_le_bytes()))
+        .and_then(|_| writer.write_all(b"WAVEfmt "))
+        .and_then(|_| writer.write_all(&16_u32.to_le_bytes()))
+        .and_then(|_| writer.write_all(&1_u16.to_le_bytes()))
+        .and_then(|_| writer.write_all(&(channels as u16).to_le_bytes()))
+        .and_then(|_| writer.write_all(&sample_rate.to_le_bytes()))
+        .and_then(|_| writer.write_all(&byte_rate.to_le_bytes()))
+        .and_then(|_| writer.write_all(&block_align.to_le_bytes()))
+        .and_then(|_| writer.write_all(&16_u16.to_le_bytes()))
+        .and_then(|_| writer.write_all(b"data"))
+        .and_then(|_| writer.write_all(&data_bytes.to_le_bytes()))
+        .map_err(|error| format!("could not write WAV header: {error}"))?;
+
+    let frame_count = samples.len() / channels;
+    for (frame_index, frame) in samples.chunks_exact(channels).enumerate() {
+        let gain = db_to_linear(envelope.gain_at(frame_index as f32 / frame_count as f32));
+        for &sample in frame {
+            let sample = if sample.is_finite() {
+                (sample * gain).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            let pcm = if sample <= -1.0 {
+                i16::MIN
+            } else {
+                (sample * i16::MAX as f32).round() as i16
+            };
+            writer
+                .write_all(&pcm.to_le_bytes())
+                .map_err(|error| format!("could not write WAV samples: {error}"))?;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("could not finish WAV export: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +285,21 @@ mod tests {
         assert_eq!(audio.samples.len(), samples.len());
         assert_eq!(audio.samples[0], -1.0);
         assert!(audio.samples[5] > 0.99);
+    }
+
+    #[test]
+    fn wav_export_applies_region_envelope_to_samples() {
+        let path =
+            std::env::temp_dir().join(format!("rina-audio-export-{}.wav", std::process::id()));
+        let samples = [0.25, 0.25, 0.5, 0.5];
+        let mut envelope = GainEnvelope::default();
+        envelope.set_region(0.5, 1.0, -6.0206);
+
+        export_wav(&path, &samples, 8000, 1, &envelope).unwrap();
+        let exported = decode_audio(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!((exported.samples[0] - 0.25).abs() < 0.001);
+        assert!((exported.samples[2] - 0.25).abs() < 0.001);
     }
 }
